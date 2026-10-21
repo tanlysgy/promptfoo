@@ -109,10 +109,16 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/_atlas_site"; mkdir -p "$GITHUB_WORKSPACE/_atlas_site"
           cp -a "$OUT"/. "$GITHUB_WORKSPACE/_atlas_site/" 2>/dev/null || true
 
-      - uses: actions/setup-node@v5
+      - name: Setup node + pnpm
         if: steps.detect.outputs.docusaurus_cfg != '' && hashFiles('_atlas_site/index.html') == ''
-        with:
-          node-version: "22"
+        continue-on-error: true
+        run: |
+          curl -sSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1 || true
+          sudo apt-get install -y nodejs >/dev/null 2>&1 || true
+          node -v || true
+          sudo corepack enable >/dev/null 2>&1 || true
+          corepack prepare pnpm@9 --activate >/dev/null 2>&1 || sudo npm install -g pnpm@9 >/dev/null 2>&1 || true
+          pnpm -v || true
       - name: Build · docusaurus
         if: steps.detect.outputs.docusaurus_cfg != '' && hashFiles('_atlas_site/index.html') == ''
         continue-on-error: true
@@ -139,38 +145,77 @@ jobs:
         if: hashFiles('_atlas_site/index.html') == ''
         run: |
           python3 - <<'PY'
-          import os, pathlib, re, sys
+          import pathlib, shutil, sys
+
           root = pathlib.Path(".")
-          cands = ["docs", "doc", "documentation", "website/docs", "website/content", "content", "site/docs"]
-          def n(d):
+          def count(d):
               p = root / d
-              return len(list(p.rglob("*.md"))) if p.is_dir() else -1
-          best = max(cands, key=n)
-          if n(best) <= 0:
-              extra = [str(p.relative_to(root)) for p in root.glob("*/docs") if p.is_dir()]
-              best = max(extra, key=n) if extra else None
-          if not best or n(best) <= 0:
-              raise SystemExit("no markdown docs")
-          print("docs dir:", best, n(best), file=sys.stderr)
+              return len([x for x in p.rglob("*.md")]) if p.is_dir() else -1
+
+          cands = ["docs", "doc", "documentation", "website/docs", "website/content",
+                   "content", "site/docs", "wiki", "manual"]
+          extra = [str(p.relative_to(root)) for p in root.glob("*/docs") if p.is_dir()]
+          extra += [str(p.relative_to(root)) for p in root.glob("*/*/docs") if p.is_dir()]
+          best, best_n = None, 0
+          for c in cands + extra:
+              n = count(c)
+              if n > best_n:
+                  best, best_n = c, n
+
+          if best is None:
+              # last resort: single page site made from top-level markdown
+              stage = root / "_atlas_docs"
+              stage.mkdir(exist_ok=True)
+              picked = 0
+              for name in ("README.md", "readme.md", "README.rst", "CONTRIBUTING.md",
+                           "docs.md", "USAGE.md", "INSTALL.md", "CHANGELOG.md"):
+                  src = root / name
+                  if src.is_file() and src.suffix == ".md":
+                      shutil.copy(src, stage / ("index.md" if picked == 0 else name))
+                      picked += 1
+              if picked == 0:
+                  print("::warning::no markdown found, publishing a placeholder page")
+                  (stage / "index.md").write_text(
+                      "# Documentation mirror\n\nThis project keeps its documentation "
+                      "outside the repository. See the upstream project site.\n",
+                      encoding="utf-8")
+              best, best_n = "_atlas_docs", 1
+
+          print("docs dir:", best, "markdown files:", best_n, file=sys.stderr)
           entries = []
           for p in sorted((root / best).rglob("*.md")):
               rel = p.relative_to(root / best).as_posix()
               if any(part.startswith(".") or part == "node_modules" for part in rel.split("/")):
                   continue
-              entries.append((rel, p.stem.replace("-", " ").replace("_", " ").title() or "Index"))
+              title = p.stem.replace("-", " ").replace("_", " ").strip().title() or "Index"
+              entries.append((rel, title))
+          if not entries:
+              (root / best / "index.md").write_text("# Documentation mirror\n", encoding="utf-8")
+              entries = [("index.md", "Index")]
           entries.sort(key=lambda it: (0 if it[0].lower() == "index.md" else 1, it[0]))
-          cfg = ["site_name: Atlas docs mirror", "docs_dir: %s" % best, "use_directory_urls: true",
-                 "theme:", "  name: material", "  features:", "    - navigation.top",
-                 "    - navigation.sections", "    - navigation.expand", "    - content.code.copy",
-                 "plugins: []", "markdown_extensions:", "  - admonition", "  - attr_list",
-                 "  - tables", "  - footnotes", "  - md_in_html", "  - toc:", "      permalink: true",
-                 "  - pymdownx.superfences", "  - pymdownx.highlight", "  - pymdownx.details",
-                 "nav:"]
+
+          cfg = [
+              "site_name: Atlas docs mirror",
+              "docs_dir: %s" % best,
+              "use_directory_urls: true",
+              "theme:", "  name: material",
+              "  features:", "    - navigation.top", "    - navigation.sections",
+              "    - navigation.expand", "    - content.code.copy", "    - search.highlight",
+              "    - search.suggest",
+              "plugins: []",
+              "markdown_extensions:",
+              "  - admonition", "  - attr_list", "  - tables", "  - footnotes",
+              "  - def_list", "  - md_in_html", "  - toc:", "      permalink: true",
+              "  - pymdownx.superfences", "  - pymdownx.highlight", "  - pymdownx.details",
+              "  - pymdownx.tasklist", "  - pymdownx.tilde", "  - pymdownx.caret",
+              "nav:",
+          ]
           if len(entries) > 1:
-              cfg += ["  - %s: %s" % (nm.replace(":", " -"), rel) for rel, nm in entries[:600]]
+              cfg += ["  - %s: %s" % (t.replace(":", " -").replace("#", ""), r)
+                      for r, t in entries[:800]]
           else:
               cfg += ["  - Home: %s" % entries[0][0]]
-          open("mkdocs.atlas.yml", "w", encoding="utf-8").write("\n".join(cfg) + "\n")
+          pathlib.Path("mkdocs.atlas.yml").write_text("\n".join(cfg) + "\n", encoding="utf-8")
           PY
           mkdocs build -f mkdocs.atlas.yml -d _atlas_site
       - name: Add .nojekyll
